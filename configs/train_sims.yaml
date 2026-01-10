@@ -9,6 +9,8 @@ base:
   beta: 0.6
   gamma: 0.1
   sigma: 1.0
+  mu: 0.5  # 掩码重建损失权重
+  nu: 0.3  # 跨模态匹配损失权重
   train_mode: regression # only support regression now
   missing_rate_eval_test: 0.5   # used for evaluation and testing
   do_validation: true
