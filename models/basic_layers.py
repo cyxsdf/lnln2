@@ -45,7 +45,6 @@ class PreNorm_qkv(nn.Module):
         q = self.norm_q(q)
         k = self.norm_k(k)
         v = self.norm_v(v)
-
         return self.fn(q, k, v)
 
 class PreNorm_hyper(nn.Module):
@@ -62,7 +61,6 @@ class PreNorm_hyper(nn.Module):
         h_a = self.norm2(h_a)
         h_v = self.norm3(h_v)
         h_hyper = self.norm4(h_hyper)
-
         return self.fn(h_dominate, h_a, h_v, h_hyper)
 
 
@@ -227,7 +225,6 @@ class TransformerDecoder(nn.Module):
         return tgt
 
 
-
 class CrossTransformerEncoder(nn.Module):
     def __init__(self, dim, depth, heads, dim_head, mlp_dim, dropout = 0.):
         super().__init__()
@@ -244,7 +241,6 @@ class CrossTransformerEncoder(nn.Module):
             target_x = target_x_tmp + target_x
             target_x = ff(target_x) + target_x
         return target_x
-
 
 
 class Transformer(nn.Module):
@@ -267,7 +263,6 @@ class Transformer(nn.Module):
 
         self.pool = pool
         self.to_latent = nn.Identity()
-
 
     def forward(self, x):
         b, n, _ = x.shape
@@ -301,19 +296,87 @@ class CrossTransformer(nn.Module):
 
     def forward(self, source_x, target_x):
         b, n_s, _ = source_x.shape
-        b, n_t, _ = target_x.shape
+        
+        # 新增：分层融合模块（Hierarchical Fusion）
+class HierarchicalFusion(nn.Module):
+    def __init__(self, args):
+        super().__init__()
+        # 底层：模态内局部特征编码（自注意力）
+        self.intra_modal_encoder = nn.ModuleDict({
+            'l': TransformerEncoder(
+                dim=args['model']['dmml']['language_encoder']['input_dim'],
+                depth=args['model']['dmml']['language_encoder']['depth'],
+                heads=args['model']['dmml']['language_encoder']['heads'],
+                dim_head=int(args['model']['dmml']['language_encoder']['input_dim']/args['model']['dmml']['language_encoder']['heads']),
+                mlp_dim=args['model']['dmml']['language_encoder']['hidden_dim'],
+                dropout=0.1
+            ),
+            'v': TransformerEncoder(
+                dim=args['model']['dmml']['language_encoder']['input_dim'],
+                depth=args['model']['dmml']['language_encoder']['depth'],
+                heads=args['model']['dmml']['language_encoder']['heads'],
+                dim_head=int(args['model']['dmml']['language_encoder']['input_dim']/args['model']['dmml']['language_encoder']['heads']),
+                mlp_dim=args['model']['dmml']['language_encoder']['hidden_dim'],
+                dropout=0.1
+            ),
+            'a': TransformerEncoder(
+                dim=args['model']['dmml']['language_encoder']['input_dim'],
+                depth=args['model']['dmml']['language_encoder']['depth'],
+                heads=args['model']['dmml']['language_encoder']['heads'],
+                dim_head=int(args['model']['dmml']['language_encoder']['input_dim']/args['model']['dmml']['language_encoder']['heads']),
+                mlp_dim=args['model']['dmml']['language_encoder']['hidden_dim'],
+                dropout=0.1
+            )
+        })
+        
+        # 中层：跨模态交互融合（交叉注意力）
+        self.cross_modal_encoder = nn.ModuleList([
+            CrossTransformerEncoder(
+                dim=args['model']['dmml']['language_encoder']['input_dim'],
+                depth=args['model']['dmml']['fuison_transformer']['depth'],
+                heads=args['model']['dmml']['fuison_transformer']['heads'],
+                dim_head=int(args['model']['dmml']['fuison_transformer']['input_dim']/args['model']['dmml']['fuison_transformer']['heads']),
+                mlp_dim=args['model']['dmml']['fuison_transformer']['hidden_dim'],
+                dropout=0.1
+            ) for _ in range(2)  # 语言-视觉、语言-音频交叉
+        ])
+        
+        # 高层：全局特征融合（池化 + 加权）
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        self.fusion_linear = nn.Linear(
+            args['model']['dmml']['language_encoder']['input_dim'] * 3,
+            args['model']['dmml']['regression']['input_dim']
+        )
 
-        extra_token = repeat(self.extra_token, '1 1 d -> b 1 d', b = b)
-
-        source_x = torch.cat((extra_token, source_x), dim=1)
-        source_x = source_x + self.pos_embedding_s[:, : n_s+1]
-
-        target_x = torch.cat((extra_token, target_x), dim=1)
-        target_x = target_x + self.pos_embedding_t[:, : n_t+1]
-
-        source_x = self.dropout(source_x)
-        target_x = self.dropout(target_x)
-
-        x_s2t = self.CrossTransformerEncoder(source_x, target_x)
-
-        return x_s2t
+    def forward(self, h_l, h_v, h_a, w):
+        """
+        h_l/h_v/h_a: 各模态底层特征 (b, n, d)
+        w: 完整性校验分数 (b, 1)
+        """
+        # 1. 底层：模态内局部特征编码
+        h_l_intra = self.intra_modal_encoder['l'](h_l)
+        h_v_intra = self.intra_modal_encoder['v'](h_v)
+        h_a_intra = self.intra_modal_encoder['a'](h_a)
+        
+        # 2. 中层：跨模态交互融合
+        h_l_v = self.cross_modal_encoder[0](h_v_intra, h_l_intra)  # 语言为目标，视觉为源
+        h_l_a = self.cross_modal_encoder[1](h_a_intra, h_l_intra)  # 语言为目标，音频为源
+        h_cross = h_l_v + h_l_a + h_l_intra  # 融合跨模态特征
+        
+        # 3. 高层：全局特征融合 + 完整性加权
+        # 全局池化
+        h_l_global = self.global_pool(h_cross.transpose(1,2)).squeeze(-1)  # (b, d)
+        h_v_global = self.global_pool(h_v_intra.transpose(1,2)).squeeze(-1)
+        h_a_global = self.global_pool(h_a_intra.transpose(1,2)).squeeze(-1)
+        
+        # 基于完整性分数加权（缺失模态衰减）
+        weight = w.expand(-1, h_l_global.shape[-1])  # (b, d)
+        h_l_global = h_l_global * weight
+        h_v_global = h_v_global * weight
+        h_a_global = h_a_global * weight
+        
+        # 拼接 + 线性融合
+        h_global = torch.cat([h_l_global, h_v_global, h_a_global], dim=-1)
+        h_fused = self.fusion_linear(h_global)
+        
+        return h_fused
